@@ -7,7 +7,7 @@ import (
 	"github.com/sahib/timeq"
 )
 
-func DecodeBatch(data []byte) (uint32, timeq.Items, error) {
+func DecodeBatch(data []byte) (uint64, timeq.Items, error) {
 	var pos uint32 // just for logging
 
 	header, err := DecodeHeader(data)
@@ -60,7 +60,7 @@ type BatchEncoder struct {
 	buf []byte
 }
 
-func (be *BatchEncoder) Encode(id uint32, items timeq.Items) []byte {
+func (be *BatchEncoder) Encode(id uint64, items timeq.Items) []byte {
 	size := MessageHeaderSize
 	for idx := 0; idx < len(items); idx++ {
 		size += len(items[idx].Blob) + ItemHeaderSize

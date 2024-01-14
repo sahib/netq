@@ -1,23 +1,23 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"math"
 	"time"
 
 	"github.com/sahib/netq/protocol"
-	"github.com/sahib/timeq"
 )
-
-const pubAckTimeout = 1 * time.Second
 
 type PubHandler struct {
 	topic      *Topic
 	lastPubAck time.Time
-	lastPubID  uint32
-	currPubID  uint32
+	lastPubID  uint64
+	currPubID  uint64
 	enc        protocol.AckEncoder
+	wsBuf      bytes.Buffer
+	copyBuf    []byte
 }
 
 func NewPubHandler(topic *Topic) *PubHandler {
@@ -26,11 +26,17 @@ func NewPubHandler(topic *Topic) *PubHandler {
 		lastPubAck: time.Now(),
 		lastPubID:  math.MaxUint32,
 		currPubID:  0,
+		copyBuf:    make([]byte, 16*1024),
 	}
 }
 
-func (ph *PubHandler) OnRead(ctx context.Context, data []byte) error {
-	id, items, err := protocol.DecodeBatch(data)
+func (ph *PubHandler) OnRead(ctx context.Context, r io.Reader) error {
+	ph.wsBuf.Reset()
+	if _, err := io.CopyBuffer(&ph.wsBuf, r, ph.copyBuf); err != nil {
+		return err
+	}
+
+	id, items, err := protocol.DecodeBatch(ph.wsBuf.Bytes())
 	if err != nil {
 		return err
 	}
@@ -52,7 +58,7 @@ func (ph *PubHandler) OnWrite(ctx context.Context, w io.Writer) error {
 		return nil
 	}
 
-	_, err := w.Write(ph.enc.Encode(timeq.Key(ph.currPubID)))
+	_, err := w.Write(ph.enc.Encode(ph.currPubID))
 	ph.lastPubID = ph.currPubID
 	return err
 }

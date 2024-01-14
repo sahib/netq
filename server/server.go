@@ -15,32 +15,49 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type Config struct {
-	Addr         string
-	Websocket    *WebsocketConfig
-	StorageDir   string
-	TopicOptions TopicOptions // TODO: call it consistently options or config, also make pointers consistent.
+type Options struct {
+	Addr             string
+	StorageDir       string
+	WebsocketOptions WebsocketOptions
+	TopicOptions     TopicOptions
+	SubOptions       SubOptions
 }
 
-// TODO: validate method  for config.
-
-func DefaultConfig() *Config {
-	return &Config{
-		Addr:       "127.0.0.1:9876",
-		Websocket:  WebsocketConfigDefault(),
-		StorageDir: "/var/netq", // TODO: good default?
+func DefaultOptions() *Options {
+	return &Options{
+		Addr:             "127.0.0.1:9876",
+		StorageDir:       "/var/netq",
+		WebsocketOptions: DefaultWebsocketOptions(),
+		TopicOptions:     DefaultTopicOptions(),
+		SubOptions:       DefaultSubOptions(),
 	}
+}
+
+func (c *Options) Validate() error {
+	if err := c.TopicOptions.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.WebsocketOptions.Validate(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 type Server struct {
 	ctx    context.Context
 	cancel func()
 	srv    *http.Server
-	cfg    *Config
+	cfg    *Options
 	topics *Topics
 }
 
-func NewServer(ctx context.Context, cfg *Config) (*Server, error) {
+func NewServer(ctx context.Context, cfg *Options) (*Server, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	srv := &http.Server{
 		Addr:         cfg.Addr,
@@ -67,7 +84,13 @@ func (s *Server) Serve() error {
 	mux.HandleFunc("/sub", s.updateRequestToWebsocket)
 	mux.HandleFunc("/pub", s.updateRequestToWebsocket)
 
-	// TODO: Handlers for statistics (native prometheus support?)
+	// TODO: Implement endpoints for:
+	// - ping
+	// - clear of a specific fork
+	// - list forks
+	// - ...possibly more.
+
+	// TODO: Implement prometheus exporter
 	s.srv.Handler = mux
 
 	// run server in background:
@@ -123,6 +146,8 @@ func (s *Server) topicForRequest(r *http.Request) (*Topic, TopicSpec, error) {
 	return topic, topicSpec, err
 }
 
+// TODO: We should probably exit the ws handler after setup to save some memory.
+// See this commit here: https://github.com/gorilla/websocket/commit/80393295c1185e50d0b784d4bc5ffaa918d187b9
 func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request) {
 	upgrader := &websocket.Upgrader{}
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -131,7 +156,7 @@ func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	wsh := NewWebsocketConn(conn, s.cfg.Websocket)
+	wsh := NewWebsocketConn(conn, &s.cfg.WebsocketOptions)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -146,12 +171,9 @@ func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request
 	var handler Handler
 	switch r.URL.Path {
 	case "sub":
-		opts := SubOptions{
-			BlockSize:  2000,
-			MaxWait:    s.cfg.Websocket.PongTimeout / 2,
-			AckTimeout: 15 * time.Second,
-		}
-		handler, err = NewSubHandler(r.Context(), topic, topicSpec, opts)
+		// TODO: Make it possible to overwrite some options via query params
+		// (like AckTimeout for example)
+		handler, err = NewSubHandler(r.Context(), topic, topicSpec, s.cfg.SubOptions)
 		if err != nil {
 			wsh.abort(err)
 			return

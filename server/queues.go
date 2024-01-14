@@ -1,18 +1,22 @@
 package server
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/sahib/timeq"
 	"github.com/sahib/timeq/bucket"
+	"github.com/sahib/timeq/index"
 	"github.com/sahib/timeq/item"
+	"github.com/sahib/timeq/vlog"
 )
 
 const DefaultForkName = "default"
@@ -50,6 +54,7 @@ func (t TopicSpec) TopicName() string {
 ////////////////
 
 type Topic struct {
+	dir           string
 	broadcaster   chan bool
 	boradcasterMu sync.Mutex
 	waiting       *timeq.Queue
@@ -69,6 +74,10 @@ type TopicOptions struct {
 	TimeqOpts timeq.Options
 }
 
+func (tp *TopicOptions) Validate() error {
+	return tp.TimeqOpts.Validate()
+}
+
 func DefaultTopicOptions() TopicOptions {
 	timeqOpts := timeq.DefaultOptions()
 	timeqOpts.BucketFunc = timeq.ShiftBucketFunc(37)
@@ -83,22 +92,15 @@ func DefaultTopicOptions() TopicOptions {
 
 func NewTopic(dir string, opts TopicOptions) (*Topic, error) {
 	waitingDir := filepath.Join(dir, "waiting")
-	unackedDir := filepath.Join(dir, "unacked")
-
 	waiting, err := timeq.Open(waitingDir, opts.TimeqOpts)
 	if err != nil {
 		return nil, err
 	}
 
-	unacked, err := timeq.Open(unackedDir, opts.TimeqOpts)
-	if err != nil {
-		return nil, err
-	}
-
 	return &Topic{
+		dir:         dir,
 		broadcaster: make(chan bool),
 		waiting:     waiting,
-		unacked:     unacked,
 	}, nil
 }
 
@@ -124,14 +126,11 @@ func (t *Topic) Close() error {
 type TopicFork struct {
 	t         *Topic
 	wconsumer timeq.Consumer
-	uconsumer timeq.Consumer
+	ustore    *UnackedStore
 }
 
-// TODO: Is deferring the error really a good idea?
 func (t *Topic) Fork(name timeq.ForkName) (*TopicFork, error) {
 	var wconsumer timeq.Consumer = t.waiting
-	var uconsumer timeq.Consumer = t.unacked
-
 	if name != DefaultForkName {
 		// If the fork already exist, no extra work is done
 		// beside some basic checking.
@@ -141,23 +140,23 @@ func (t *Topic) Fork(name timeq.ForkName) (*TopicFork, error) {
 			return nil, err
 		}
 
-		ufork, err := t.unacked.Fork(name)
-		if err != nil {
-			return nil, err
-		}
-
 		wconsumer = wfork
-		uconsumer = ufork
+	}
+
+	unackedPath := filepath.Join(t.dir, "unacked", string(name))
+	ustore, err := NewUnackedStore(unackedPath)
+	if err != nil {
+		return nil, err
 	}
 
 	return &TopicFork{
 		t:         t,
 		wconsumer: wconsumer,
-		uconsumer: uconsumer,
+		ustore:    ustore,
 	}, nil
 }
 
-func (tf *TopicFork) Pop(n int, dst timeq.Items, maxWait time.Duration, fn timeq.ReadFn) error {
+func (tf *TopicFork) Pop(n int, dst timeq.Items, maxWait time.Duration, fn func(batchID uint64, items timeq.Items) error) error {
 	maxWaitTimer := time.NewTimer(maxWait)
 	for {
 		isEmpty := true
@@ -166,13 +165,18 @@ func (tf *TopicFork) Pop(n int, dst timeq.Items, maxWait time.Duration, fn timeq
 		// Move() will move the data from the waiting queue (of this specific fork)
 		// to the unacked queue (to the specific fork there).
 
-		err := tf.wconsumer.Move(n, dst, tf.t.unacked, func(items item.Items) error {
+		err := tf.wconsumer.Pop(n, dst, func(items item.Items) error {
 			if len(items) == 0 {
 				return nil
 			}
 
+			batchID, err := tf.ustore.Push(items)
+			if err != nil {
+				return err
+			}
+
 			isEmpty = false
-			return fn(items)
+			return fn(batchID, items)
 		})
 
 		if err != nil {
@@ -200,33 +204,18 @@ func (tf *TopicFork) Pop(n int, dst timeq.Items, maxWait time.Duration, fn timeq
 			return nil
 		}
 	}
-
-	return nil
 }
 
-func (tf *TopicFork) Ack(key timeq.Key) (int, error) {
-	if key != math.MaxInt64 {
-		// This makes DeleteLowerThan() to DeleteIncluding()
-		key++
-	}
-
-	defer tf.t.wakeup()
-	waitingDeleted, err := tf.wconsumer.DeleteLowerThan(key)
-	if err != nil {
-		return waitingDeleted, err
-	}
-
-	unackedDeleted, err := tf.uconsumer.DeleteLowerThan(key)
-	if err != nil {
-		return waitingDeleted + unackedDeleted, err
-	}
-
-	return waitingDeleted + unackedDeleted, nil
+func (tf *TopicFork) Ack(id uint64) (int, error) {
+	return tf.ustore.Ack(id)
 }
 
 func (tf *TopicFork) Restart() (int, error) {
 	defer tf.t.wakeup()
-	return tf.wconsumer.Shovel(tf.t.unacked)
+	return tf.ustore.Clear(func(items timeq.Items) error {
+		// Move the unacked messages back.
+		return tf.t.waiting.Push(items)
+	})
 }
 
 // TODO:
@@ -319,4 +308,140 @@ func (tt *Topics) Close() error {
 	}
 
 	return err
+}
+
+type UnackedStore struct {
+	dir    string
+	log    *vlog.Log
+	idx    *index.Index
+	idxLog *index.Writer
+	seq    uint64
+}
+
+func NewUnackedStore(dir string) (*UnackedStore, error) {
+	seqPath := filepath.Join(dir, "seq.txt")
+	seqData, err := os.ReadFile(seqPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	seqStr := string(bytes.TrimSpace(seqData))
+	if len(seqStr) == 0 {
+		seqStr = "0"
+	}
+
+	seq, err := strconv.ParseInt(seqStr, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	datLog := filepath.Join(dir, "dat.log")
+	log, err := vlog.Open(datLog, true)
+	if err != nil {
+		return nil, err
+	}
+
+	idxPath := filepath.Join(dir, "idx.log")
+	idx, err := index.Load(idxPath)
+	if err != nil {
+		return nil, errors.Join(
+			err,
+			log.Close(),
+		)
+	}
+
+	idxLog, err := index.NewWriter(idxPath, true)
+	if err != nil {
+		return nil, errors.Join(
+			err,
+			log.Close(),
+		)
+	}
+
+	return &UnackedStore{
+		seq:    uint64(seq),
+		dir:    dir,
+		log:    log,
+		idx:    idx,
+		idxLog: idxLog,
+	}, nil
+}
+
+func (us *UnackedStore) Push(items timeq.Items) (uint64, error) {
+	loc, err := us.log.Push(items)
+	if err != nil {
+		return 0, err
+	}
+
+	loc.Key = timeq.Key(us.seq)
+	us.seq++
+
+	// TODO: Sync seq number here... occassionally?
+
+	if err := us.idxLog.Push(loc, us.idx.Trailer()); err != nil {
+		return 0, err
+	}
+
+	us.idx.Set(loc)
+	return uint64(loc.Key), nil
+}
+
+func (us *UnackedStore) Ack(id uint64) (int, error) {
+	// delete the referenced batch from the index
+	// and push a marker to the idx log that indicate it was
+	// deleted (used during reconstruction of the log.)
+
+	// TODO: Delete() should return the deleted loc, so we can
+	// figure out the number of items we acknowledged.
+	us.idx.Delete(timeq.Key(id))
+	return 0, us.idxLog.Push(item.Location{
+		Key: timeq.Key(id),
+		Off: 0,
+		Len: 0,
+	}, us.idx.Trailer())
+}
+
+// Clear will clear out all still unacknowledged messages from the store
+// and call `fn` for each of them. It returns the number of unacked messages
+// and, possibly, an error.
+func (us *UnackedStore) Clear(fn timeq.ReadFn) (int, error) {
+	iter := us.idx.Iter()
+	items := make(timeq.Items, 0, 2000)
+	unacked := 0
+
+	for iter.Next() {
+		loc := iter.Value()
+		if loc.Len == 0 {
+			// acked batch.
+			continue
+		}
+
+		items = items[:0]
+		logIter := us.log.At(loc, true)
+		for logIter.Next() {
+			items = append(items, logIter.Item())
+		}
+
+		if err := logIter.Err(); err != nil {
+			return unacked, err
+		}
+
+		unacked += len(items)
+		if err := fn(items); err != nil {
+			return unacked, err
+		}
+	}
+
+	// clear the directory, since we finished clearing:
+	return unacked, errors.Join(
+		os.RemoveAll(us.dir),
+		os.MkdirAll(us.dir, 0700),
+	)
+}
+
+func (us *UnackedStore) Close() error {
+	return errors.Join(
+		us.idxLog.Close(),
+		us.log.Close(),
+	)
 }

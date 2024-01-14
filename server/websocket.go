@@ -10,17 +10,19 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Handler is the interface of any websocket consumer
+// In practice, this is either sub or pub.
 type Handler interface {
 	OnWrite(ctx context.Context, w io.Writer) error
-	OnRead(ctx context.Context, data []byte) error
+	OnRead(ctx context.Context, r io.Reader) error
 }
 
-type WebsocketConfig struct {
+type WebsocketOptions struct {
 	PingInterval time.Duration
 	PongTimeout  time.Duration
 }
 
-func (wc *WebsocketConfig) Validate() error {
+func (wc *WebsocketOptions) Validate() error {
 	if wc.PingInterval < time.Second {
 		return fmt.Errorf("ping_interval must be at least 1s")
 	}
@@ -32,24 +34,28 @@ func (wc *WebsocketConfig) Validate() error {
 	return nil
 }
 
-func WebsocketConfigDefault() *WebsocketConfig {
-	return &WebsocketConfig{
+func DefaultWebsocketOptions() WebsocketOptions {
+	return WebsocketOptions{
 		PingInterval: 5 * time.Second,
 		PongTimeout:  15 * time.Second,
 	}
 }
 
 type WebsocketConn struct {
-	cfg    *WebsocketConfig
+	opts   *WebsocketOptions
 	conn   *websocket.Conn
 	cancel func()
 }
 
-func NewWebsocketConn(conn *websocket.Conn, cfg *WebsocketConfig) *WebsocketConn {
+func NewWebsocketConn(conn *websocket.Conn, cfg *WebsocketOptions) *WebsocketConn {
 	return &WebsocketConn{
-		cfg:  cfg,
+		opts: cfg,
 		conn: conn,
 	}
+}
+
+func (h *WebsocketConn) Options() *WebsocketOptions {
+	return h.opts
 }
 
 func (h *WebsocketConn) abort(err error) {
@@ -85,8 +91,8 @@ func (h *WebsocketConn) abort(err error) {
 
 }
 
-func (h *WebsocketConn) serveWrites(ctx context.Context, cancel func(), handler Handler) {
-	ticker := time.NewTicker(h.cfg.PingInterval)
+func (h *WebsocketConn) serveWrites(ctx context.Context, handler Handler) {
+	ticker := time.NewTicker(h.opts.PingInterval)
 	defer ticker.Stop()
 
 	for {
@@ -110,9 +116,9 @@ func (h *WebsocketConn) serveWrites(ctx context.Context, cancel func(), handler 
 	}
 }
 
-func (h *WebsocketConn) serveReads(ctx context.Context, cancel func(), handler Handler) {
+func (h *WebsocketConn) serveReads(ctx context.Context, handler Handler) {
 	for {
-		if err := h.conn.SetReadDeadline(time.Now().Add(h.cfg.PongTimeout)); err != nil {
+		if err := h.conn.SetReadDeadline(time.Now().Add(h.opts.PongTimeout)); err != nil {
 			h.abort(fmt.Errorf("failed to set deadline: %w", err))
 			return
 		}
@@ -123,16 +129,8 @@ func (h *WebsocketConn) serveReads(ctx context.Context, cancel func(), handler H
 			return
 		}
 
-		// OPTIMIZATION: Re-use a buffer instead of allocating one all the
-		// time. This can be done by having a large buffer and using it in a
-		// ringbuffer like fashion. For now ReadAll is fine enough.
-		data, err := io.ReadAll(r)
-		if err != nil {
-			h.abort(fmt.Errorf("failed to read: %v", err))
-			return
-		}
-
-		if err := handler.OnRead(ctx, data); err != nil {
+		// NOTE:We assume that OnRead() does not immediately return
+		if err := handler.OnRead(ctx, r); err != nil {
 			h.abort(fmt.Errorf("failed to handle what we read: %w", err))
 			return
 		}
@@ -150,21 +148,22 @@ func (h *WebsocketConn) Serve(ctx context.Context, handler Handler) {
 	//
 	// We also send pings regularly to learn if the client is still alive.
 	// See the SetPongHandler() call below.
-	go h.serveWrites(ctx, cancel, handler)
+	go h.serveWrites(ctx, handler)
 
 	// Whenever an alive connection returns a PONG, this function is called.
 	// We use this to check if the peer is still alive and well. If not
 	// we clean up the connection to save resources.
 	h.conn.SetPongHandler(func(string) error {
 		// extend the read deadline for some time:
-		if err := h.conn.SetReadDeadline(time.Now().Add(h.cfg.PongTimeout)); err != nil {
+		if err := h.conn.SetReadDeadline(time.Now().Add(h.opts.PongTimeout)); err != nil {
 			h.abort(fmt.Errorf("failed to set deadline: %w", err))
+			return err
 		}
 
 		return nil
 	})
 
-	h.serveReads(ctx, cancel, handler)
+	h.serveReads(ctx, handler)
 }
 
 // small wrapper around websocket.Conn to allow easy usage for OnWrite()

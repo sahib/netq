@@ -1,0 +1,42 @@
+# This file controls how netq is build.
+# It is a nicer to use alternative to Makefiles.
+# Please read the documentation over at:
+#
+# https://taskfile.dev
+#
+# The actual commands that do the work are written in bash.
+# See the build/ folder for them.
+#
+# When changing the structure of the repository, please remember
+# to update the "sources" list in this file if dependencies
+# of a build target were added, removed or changed.
+version: '3'
+
+tasks:
+  default:
+    deps: [build]
+
+  build:
+    desc: "Build netq"
+    cmds:
+      - go build netq.go
+    sources:
+      - ./*.go
+      - ./**/*.go
+    generates:
+      - ./netq
+
+  test:
+    desc: "Run integration & unit tests"
+    cmds:
+      - gotestsum
+
+  lint:
+    desc: "Runs a bunch of linters"
+    cmds:
+      - golangci-lint run ./...
+
+  sloc:
+    desc: "Count the lines of code"
+    cmds:
+      - sh ./build/count-lines.sh

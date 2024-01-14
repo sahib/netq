@@ -33,7 +33,7 @@ func (tc *TestCtx) Teardown(t *testing.T) {
 
 func Setup(t *testing.T) *TestCtx {
 	port := nextFreePort(t)
-	cfg := DefaultConfig()
+	cfg := DefaultOptions()
 	cfg.Addr = fmt.Sprintf("localhost:%d", port)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // max time for test.

@@ -7,8 +7,7 @@ import (
 
 const (
 	MessageHeaderSize = 12
-	ItemHeaderSize    = 12
-	ErrorHeaderSize   = 4
+	ItemHeaderSize    = 16
 
 	MaxMessageSize = 64 * 1024 * 1024
 	MaxItemSize    = 16 * 1024 * 1024
@@ -35,7 +34,7 @@ func (t Type) Validate() error {
 type Header struct {
 	Type Type
 	Size uint32
-	ID   uint32 // TODO: big enough?
+	ID   uint64
 }
 
 // DecodeHeader parses the header from `data`. It's okay to pass only $HeaderSize bytes
@@ -56,12 +55,12 @@ func DecodeHeader(data []byte) (Header, error) {
 		return header, fmt.Errorf("message is bigger than %d: %v", MaxMessageSize, header.Size)
 	}
 
-	header.ID = binary.BigEndian.Uint32(data[8:12])
+	header.ID = binary.BigEndian.Uint64(data[8:12])
 	return header, nil
 }
 
 func EncodeHeader(buf []byte, header Header) {
-	binary.BigEndian.PutUint32(buf[0:4], uint32(header.Type))
-	binary.BigEndian.PutUint32(buf[4:8], header.Size)
-	binary.BigEndian.PutUint32(buf[8:12], header.ID)
+	binary.BigEndian.PutUint32(buf[0:], uint32(header.Type))
+	binary.BigEndian.PutUint32(buf[4:], header.Size)
+	binary.BigEndian.PutUint64(buf[8:], header.ID)
 }

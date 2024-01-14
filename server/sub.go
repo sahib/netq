@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"time"
@@ -11,9 +13,27 @@ import (
 )
 
 type SubOptions struct {
-	BlockSize  int
-	MaxWait    time.Duration
+	BlockSize  uint
 	AckTimeout time.Duration
+}
+
+func (so *SubOptions) Validate() error {
+	if so.BlockSize < 1 {
+		return errors.New("block must be at least 1")
+	}
+
+	if so.AckTimeout < time.Second {
+		return errors.New("ack timeout should be at least 1s")
+	}
+
+	return nil
+}
+
+func DefaultSubOptions() SubOptions {
+	return SubOptions{
+		BlockSize:  2000,
+		AckTimeout: 15 * time.Second,
+	}
 }
 
 type SubHandler struct {
@@ -24,6 +44,8 @@ type SubHandler struct {
 	itemBuf  timeq.Items
 	opts     SubOptions
 	idCount  uint32
+	wsBuf    bytes.Buffer
+	copyBuf  []byte
 }
 
 func NewSubHandler(ctx context.Context, topic *Topic, topicSpec TopicSpec, opts SubOptions) (*SubHandler, error) {
@@ -48,6 +70,7 @@ func NewSubHandler(ctx context.Context, topic *Topic, topicSpec TopicSpec, opts 
 		fork:     fork,
 		ackReset: make(chan bool, 5),
 		itemBuf:  make(timeq.Items, 0, opts.BlockSize),
+		copyBuf:  make([]byte, 16*1024),
 	}
 
 	go sh.handleAcks()
@@ -77,13 +100,18 @@ func (sh *SubHandler) handleAcks() {
 	}
 }
 
-func (sh *SubHandler) OnRead(ctx context.Context, data []byte) error {
-	key, err := protocol.DecodeAck(data)
+func (sh *SubHandler) OnRead(ctx context.Context, r io.Reader) error {
+	sh.wsBuf.Reset()
+	if _, err := io.CopyBuffer(&sh.wsBuf, r, sh.copyBuf); err != nil {
+		return err
+	}
+
+	id, err := protocol.DecodeAck(sh.wsBuf.Bytes())
 	if err != nil {
 		return err
 	}
 
-	acked, err := sh.fork.Ack(key)
+	acked, err := sh.fork.Ack(id)
 	if err != nil {
 		return err
 	}
@@ -95,12 +123,12 @@ func (sh *SubHandler) OnRead(ctx context.Context, data []byte) error {
 
 func (sh *SubHandler) OnWrite(ctx context.Context, w io.Writer) error {
 	return sh.fork.Pop(
-		sh.opts.BlockSize,
+		int(sh.opts.BlockSize),
 		sh.itemBuf[:0],
-		sh.opts.MaxWait,
-		func(items timeq.Items) error {
+		time.Second,
+		func(batchID uint64, items timeq.Items) error {
 			sh.idCount++
-			_, err := w.Write(sh.enc.Encode(sh.idCount, items))
+			_, err := w.Write(sh.enc.Encode(batchID, items))
 			return err
 		},
 	)
