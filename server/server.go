@@ -170,7 +170,7 @@ func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request
 
 	var handler Handler
 	switch r.URL.Path {
-	case "sub":
+	case "/sub":
 		// TODO: Make it possible to overwrite some options via query params
 		// (like AckTimeout for example)
 		handler, err = NewSubHandler(r.Context(), topic, topicSpec, s.cfg.SubOptions)
@@ -178,10 +178,11 @@ func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request
 			wsh.abort(err)
 			return
 		}
-	case "pub":
+	case "/pub":
 		handler = NewPubHandler(topic)
 	default:
 		wsh.abort(fmt.Errorf("invalid handler path: %s", r.URL.Path))
+		return
 	}
 
 	wsh.Serve(ctx, handler)

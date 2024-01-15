@@ -24,7 +24,24 @@ const DefaultForkName = "default"
 type TopicSpec string
 
 func (t TopicSpec) Validate() error {
-	// TODO: Figure out rules. Include fork names via slash?
+	if len(t) == 0 {
+		return errors.New("topic may not be empty")
+	}
+
+	// We just re-use the rules for fork-name here.
+	split := strings.SplitN(string(t), "/", 2)
+	if len(split) < 2 {
+		return timeq.ForkName(t).Validate()
+	}
+
+	if err := timeq.ForkName(split[0]).Validate(); err != nil {
+		return fmt.Errorf("topic name: %w", err)
+	}
+
+	if err := timeq.ForkName(split[1]).Validate(); err != nil {
+		return fmt.Errorf("fork name: %w", err)
+	}
+
 	return nil
 }
 
@@ -58,7 +75,6 @@ type Topic struct {
 	broadcaster   chan bool
 	boradcasterMu sync.Mutex
 	waiting       *timeq.Queue
-	unacked       *timeq.Queue
 }
 
 type timeqLogger struct {
@@ -117,10 +133,7 @@ func (t *Topic) Push(items timeq.Items) error {
 }
 
 func (t *Topic) Close() error {
-	return errors.Join(
-		t.waiting.Close(),
-		t.unacked.Close(),
-	)
+	return t.waiting.Close()
 }
 
 type TopicFork struct {
@@ -266,10 +279,12 @@ func (tt *Topics) Ref(ts TopicSpec) (*Topic, error) {
 			return nil, err
 		}
 
-		tt.loaded[ts] = &topicRef{
+		ref = &topicRef{
 			RefCount: 0,
 			Topic:    topic,
 		}
+
+		tt.loaded[ts] = ref
 	}
 
 	ref.RefCount++
@@ -319,6 +334,10 @@ type UnackedStore struct {
 }
 
 func NewUnackedStore(dir string) (*UnackedStore, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+
 	seqPath := filepath.Join(dir, "seq.txt")
 	seqData, err := os.ReadFile(seqPath)
 	if err != nil && !os.IsNotExist(err) {

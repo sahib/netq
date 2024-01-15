@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -21,24 +22,32 @@ func nextFreePort(t *testing.T) int {
 
 type TestCtx struct {
 	wg     *sync.WaitGroup
-	srv *Server
+	srv    *Server
 	wsConn *websocket.Conn
+	tmpDir string
+	cancel func()
 }
 
 func (tc *TestCtx) Teardown(t *testing.T) {
+	tc.cancel()
+	tc.wg.Wait()
+	require.NoError(t, os.RemoveAll(tc.tmpDir))
 	require.NoError(t, tc.wsConn.Close())
 	require.NoError(t, tc.srv.Close())
-	tc.wg.Wait()
+
 }
 
 func Setup(t *testing.T) *TestCtx {
 	port := nextFreePort(t)
+
+	tmpDir, err := os.MkdirTemp("", "netq-test-ws")
+	require.NoError(t, err)
+
 	cfg := DefaultOptions()
 	cfg.Addr = fmt.Sprintf("localhost:%d", port)
+	cfg.StorageDir = tmpDir
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // max time for test.
-	defer cancel()
-
 	srv, err := NewServer(ctx, cfg)
 	require.NoError(t, err)
 
@@ -50,14 +59,27 @@ func Setup(t *testing.T) *TestCtx {
 		require.NoError(t, srv.Serve())
 	}()
 
-	url := fmt.Sprintf("ws://localhost:%d/sub", port)
-	wsConn, _, err := websocket.DefaultDialer.Dial(url, nil)
-	require.NoError(t, err)
+	url := fmt.Sprintf("ws://localhost:%d/sub?topic=foo", port)
+
+	var wsConn *websocket.Conn
+	for idx := 0; idx < 10; idx++ {
+		wsConn, _, err = websocket.DefaultDialer.Dial(url, nil)
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		break
+	}
+
+	require.NotNil(t, wsConn)
 
 	return &TestCtx{
 		wg:     &wg,
-		srv: srv,
+		srv:    srv,
 		wsConn: wsConn,
+		tmpDir: tmpDir,
+		cancel: cancel,
 	}
 }
 
@@ -65,12 +87,9 @@ func TestWebsocketHandler(t *testing.T) {
 	tc := Setup(t)
 	defer tc.Teardown(t)
 
-	for idx := 0; idx < 10; idx++ {
-		require.NoError(t, tc.wsConn.WriteMessage(
-			websocket.BinaryMessage,
-			[]byte("hello world"),
-		))
-		time.Sleep(time.Second)
-	}
-
+	require.NoError(t, tc.wsConn.WriteMessage(
+		websocket.BinaryMessage,
+		[]byte("hello world"),
+	))
+	time.Sleep(2 * time.Second)
 }
