@@ -7,12 +7,24 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+var (
+	// We set thee buffer pool to safe some memory, as described in this commit:
+	// https://github.com/gorilla/websocket/commit/80393295c1185e50d0b784d4bc5ffaa918d187b9
+	upgrader = &websocket.Upgrader{
+		ReadBufferSize:  256,
+		WriteBufferSize: 256,
+		WriteBufferPool: &sync.Pool{},
+	}
 )
 
 type Options struct {
@@ -83,12 +95,7 @@ func (s *Server) Serve() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sub", s.updateRequestToWebsocket)
 	mux.HandleFunc("/pub", s.updateRequestToWebsocket)
-
-	// TODO: Implement endpoints for:
-	// - ping
-	// - clear of a specific fork
-	// - list forks
-	// - ...possibly more.
+	mux.HandleFunc("/cmd", s.updateRequestToWebsocket)
 
 	// TODO: Implement prometheus exporter
 	s.srv.Handler = mux
@@ -133,10 +140,8 @@ func (s *Server) Close() error {
 	return nil
 }
 
-func (s *Server) topicForRequest(r *http.Request) (*Topic, TopicSpec, error) {
-	vals := r.URL.Query()
+func (s *Server) topicForRequest(vals url.Values) (*Topic, TopicSpec, error) {
 	topicSpecRaw := vals.Get("topic")
-
 	topicSpec := TopicSpec(topicSpecRaw)
 	if err := topicSpec.Validate(); err != nil {
 		return nil, "", err
@@ -147,9 +152,7 @@ func (s *Server) topicForRequest(r *http.Request) (*Topic, TopicSpec, error) {
 }
 
 // TODO: We should probably exit the ws handler after setup to save some memory.
-// See this commit here: https://github.com/gorilla/websocket/commit/80393295c1185e50d0b784d4bc5ffaa918d187b9
 func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request) {
-	upgrader := &websocket.Upgrader{}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Fprintf(w, "failed to upgrade: %v", err)
@@ -160,7 +163,8 @@ func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	topic, topicSpec, err := s.topicForRequest(r)
+	vals := r.URL.Query()
+	topic, topicSpec, err := s.topicForRequest(vals)
 	if err != nil {
 		wsh.abort(err)
 		return
@@ -171,9 +175,14 @@ func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request
 	var handler Handler
 	switch r.URL.Path {
 	case "/sub":
-		// TODO: Make it possible to overwrite some options via query params
-		// (like AckTimeout for example)
-		handler, err = NewSubHandler(r.Context(), topic, topicSpec, s.cfg.SubOptions)
+		// Allow overwriting parts of the configuration via query params:
+		subOpts, err := s.cfg.SubOptions.OverlayWithURLParams(vals)
+		if err != nil {
+			wsh.abort(err)
+			return
+		}
+
+		handler, err = NewSubHandler(r.Context(), topic, topicSpec, subOpts)
 		if err != nil {
 			wsh.abort(err)
 			return
@@ -185,5 +194,7 @@ func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	wsh.Serve(ctx, handler)
+	// NOTE: Let the handler return, we'll handle the websocket in another go routine.
+	// The http webserver can then GC open buffers.
+	go wsh.Serve(ctx, handler)
 }

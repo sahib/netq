@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"time"
 
 	"github.com/sahib/netq/protocol"
@@ -27,6 +29,22 @@ func (so *SubOptions) Validate() error {
 	}
 
 	return nil
+}
+
+func (so *SubOptions) OverlayWithURLParams(vals url.Values) (SubOptions, error) {
+	copy := *so
+	ackTimeoutStr := vals.Get("ack_timeout")
+	if ackTimeoutStr == "" {
+		return copy, nil
+	}
+
+	ackTimeout, err := time.ParseDuration(ackTimeoutStr)
+	if err != nil {
+		return copy, fmt.Errorf("failed to parse ack timeout: %w", err)
+	}
+
+	copy.AckTimeout = ackTimeout
+	return copy, copy.Validate()
 }
 
 func DefaultSubOptions() SubOptions {
@@ -123,6 +141,7 @@ func (sh *SubHandler) OnRead(ctx context.Context, r io.Reader) error {
 
 func (sh *SubHandler) OnWrite(ctx context.Context, w io.Writer) error {
 	return sh.fork.Pop(
+		ctx,
 		int(sh.opts.BlockSize),
 		sh.itemBuf[:0],
 		time.Second,

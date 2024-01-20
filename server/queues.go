@@ -2,9 +2,11 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -156,8 +158,9 @@ func (t *Topic) Fork(name timeq.ForkName) (*TopicFork, error) {
 		wconsumer = wfork
 	}
 
+	// TODO: We should use the same unacked store if a fork is used several times.
 	unackedPath := filepath.Join(t.dir, "unacked", string(name))
-	ustore, err := NewUnackedStore(unackedPath)
+	ustore, err := LoadUnackedStore(unackedPath)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +172,7 @@ func (t *Topic) Fork(name timeq.ForkName) (*TopicFork, error) {
 	}, nil
 }
 
-func (tf *TopicFork) Pop(n int, dst timeq.Items, maxWait time.Duration, fn func(batchID uint64, items timeq.Items) error) error {
+func (tf *TopicFork) Pop(ctx context.Context, n int, dst timeq.Items, maxWait time.Duration, fn func(batchID uint64, items timeq.Items) error) error {
 	maxWaitTimer := time.NewTimer(maxWait)
 	for {
 		isEmpty := true
@@ -208,6 +211,8 @@ func (tf *TopicFork) Pop(n int, dst timeq.Items, maxWait time.Duration, fn func(
 		tf.t.boradcasterMu.Unlock()
 
 		select {
+		case <-ctx.Done():
+			return nil
 		case <-ch:
 			// something happened on the writing end,
 			// we should go and pop from the queue again!
@@ -231,12 +236,26 @@ func (tf *TopicFork) Restart() (int, error) {
 	})
 }
 
+func (tf *TopicFork) Clear() (int, error) {
+	defer tf.t.wakeup()
+
+	waitingDeleted, err := tf.wconsumer.DeleteLowerThan(timeq.Key(math.MaxInt64))
+	if err != nil {
+		return 0, err
+	}
+
+	unackedDeleted, err := tf.ustore.Clear(nil)
+	if err != nil {
+		return waitingDeleted, err
+	}
+
+	return waitingDeleted + unackedDeleted, nil
+}
+
 // TODO:
 // IDEAS:
 //
-// * SUPPLY PRIORITY FROM CLIENT SIDE (by default time.Now().UnixNano())
-// * PASS topic/fork ON SUB - CREATE topic + fork if needed.
-// * HAVE MAXIMUM SIZE OF THE UNACKED QUEUE PER TOPIC (can't have it per fork...)
+// * HAVE MAXIMUM SIZE OF THE UNACKED QUEUE PER TOPIC
 // * MAX-SIZE for each topic and general max-size
 
 ////////////////
@@ -333,7 +352,7 @@ type UnackedStore struct {
 	seq    uint64
 }
 
-func NewUnackedStore(dir string) (*UnackedStore, error) {
+func LoadUnackedStore(dir string) (*UnackedStore, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
@@ -446,8 +465,11 @@ func (us *UnackedStore) Clear(fn timeq.ReadFn) (int, error) {
 		}
 
 		unacked += len(items)
-		if err := fn(items); err != nil {
-			return unacked, err
+
+		if fn != nil {
+			if err := fn(items); err != nil {
+				return unacked, err
+			}
 		}
 	}
 

@@ -87,9 +87,19 @@ func TestWebsocketHandler(t *testing.T) {
 	tc := Setup(t)
 	defer tc.Teardown(t)
 
+	tc.wsConn.SetCloseHandler(func(code int, text string) error {
+		fmt.Println(code, text)
+		return nil
+	})
+
 	require.NoError(t, tc.wsConn.WriteMessage(
 		websocket.BinaryMessage,
 		[]byte("hello world"),
 	))
-	time.Sleep(2 * time.Second)
+
+	// Since we wrote nothing that netq could parse, we should
+	// get an error.
+	_, _, err := tc.wsConn.ReadMessage()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "1006")
 }

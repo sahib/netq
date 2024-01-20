@@ -99,7 +99,8 @@ func (h *WebsocketConn) abort(err error) {
 	h.cancel()
 	h.cancel = nil
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
+	fmt.Println("CLOSE")
 	h.conn.Close()
 }
 
@@ -110,7 +111,13 @@ func (h *WebsocketConn) serveWrites(ctx context.Context, handler Handler) {
 	for {
 		select {
 		case <-ctx.Done():
-			h.abort(fmt.Errorf("context canceled: %w", ctx.Err()))
+			// check if the cancel was due to an read error:
+			err, ok := <-h.abortCh
+			if !ok {
+				err = ctx.Err()
+			}
+
+			h.abort(err)
 			return
 		case err := <-h.abortCh:
 			h.abort(err)
@@ -135,18 +142,21 @@ func (h *WebsocketConn) serveReads(ctx context.Context, handler Handler) {
 	for {
 		if err := h.conn.SetReadDeadline(time.Now().Add(h.opts.PongTimeout)); err != nil {
 			h.abortCh <- fmt.Errorf("failed to set deadline: %w", err)
+			h.cancel()
 			return
 		}
 
 		_, r, err := h.conn.NextReader()
 		if err != nil {
 			h.abortCh <- fmt.Errorf("failed to read next message: %w", err)
+			h.cancel()
 			return
 		}
 
 		// NOTE:We assume that OnRead() does not immediately return and does not block too long.
 		if err := handler.OnRead(ctx, r); err != nil {
 			h.abortCh <- fmt.Errorf("failed to handle what we read: %w", err)
+			h.cancel()
 			return
 		}
 	}

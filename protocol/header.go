@@ -20,6 +20,7 @@ const (
 	TypeItems
 	TypeError
 	TypeAck
+	TypeCmd
 	typeMax
 )
 
