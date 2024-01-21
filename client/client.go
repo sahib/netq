@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -83,9 +84,13 @@ func (c *Client) reconnect(ctx context.Context, err error, url string) *websocke
 }
 
 func (c *Client) buildURL(path string, params map[string]string) string {
-	// TODO: Support wss as protocol scheme.
+	scheme := "ws"
+	if strings.HasPrefix(c.opts.Addr, "wss") {
+		scheme = "wss"
+	}
+
 	u := url.URL{
-		Scheme: "ws",
+		Scheme: scheme,
 		Host:   c.opts.Addr,
 		Path:   path,
 	}

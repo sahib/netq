@@ -77,6 +77,7 @@ type Topic struct {
 	broadcaster   chan bool
 	boradcasterMu sync.Mutex
 	waiting       *timeq.Queue
+	loadedUnacked map[string]*UnackedStore
 }
 
 type timeqLogger struct {
@@ -116,9 +117,10 @@ func NewTopic(dir string, opts TopicOptions) (*Topic, error) {
 	}
 
 	return &Topic{
-		dir:         dir,
-		broadcaster: make(chan bool),
-		waiting:     waiting,
+		dir:           dir,
+		broadcaster:   make(chan bool),
+		waiting:       waiting,
+		loadedUnacked: make(map[string]*UnackedStore, 1),
 	}, nil
 }
 
@@ -158,11 +160,18 @@ func (t *Topic) Fork(name timeq.ForkName) (*TopicFork, error) {
 		wconsumer = wfork
 	}
 
-	// TODO: We should use the same unacked store if a fork is used several times.
+	// NOTE: We should always use the same ustore for all forks that act on the
+	// same topic. Otherwise we will get some nasty race conditions.
 	unackedPath := filepath.Join(t.dir, "unacked", string(name))
-	ustore, err := LoadUnackedStore(unackedPath)
-	if err != nil {
-		return nil, err
+	ustore, ok := t.loadedUnacked[unackedPath]
+	if !ok {
+		var err error
+		ustore, err = LoadUnackedStore(unackedPath)
+		if err != nil {
+			return nil, err
+		}
+
+		t.loadedUnacked[unackedPath] = ustore
 	}
 
 	return &TopicFork{
@@ -251,12 +260,6 @@ func (tf *TopicFork) Clear() (int, error) {
 
 	return waitingDeleted + unackedDeleted, nil
 }
-
-// TODO:
-// IDEAS:
-//
-// * HAVE MAXIMUM SIZE OF THE UNACKED QUEUE PER TOPIC
-// * MAX-SIZE for each topic and general max-size
 
 ////////////////
 
@@ -350,6 +353,7 @@ type UnackedStore struct {
 	idx    *index.Index
 	idxLog *index.Writer
 	seq    uint64
+	seqFd  *os.File
 }
 
 func LoadUnackedStore(dir string) (*UnackedStore, error) {
@@ -373,9 +377,15 @@ func LoadUnackedStore(dir string) (*UnackedStore, error) {
 		return nil, err
 	}
 
+	seqFd, err := os.OpenFile(seqPath, os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, err
+	}
+
 	datLog := filepath.Join(dir, "dat.log")
 	log, err := vlog.Open(datLog, true)
 	if err != nil {
+		seqFd.Close()
 		return nil, err
 	}
 
@@ -384,6 +394,7 @@ func LoadUnackedStore(dir string) (*UnackedStore, error) {
 	if err != nil {
 		return nil, errors.Join(
 			err,
+			seqFd.Close(),
 			log.Close(),
 		)
 	}
@@ -392,16 +403,18 @@ func LoadUnackedStore(dir string) (*UnackedStore, error) {
 	if err != nil {
 		return nil, errors.Join(
 			err,
+			seqFd.Close(),
 			log.Close(),
 		)
 	}
 
 	return &UnackedStore{
-		seq:    uint64(seq),
 		dir:    dir,
 		log:    log,
 		idx:    idx,
 		idxLog: idxLog,
+		seq:    uint64(seq),
+		seqFd:  seqFd,
 	}, nil
 }
 
@@ -414,7 +427,20 @@ func (us *UnackedStore) Push(items timeq.Items) (uint64, error) {
 	loc.Key = timeq.Key(us.seq)
 	us.seq++
 
-	// TODO: Sync seq number here... occassionally?
+	// Sync the current sequence number to disk to make sure
+	// we start with the proper one. This could be probably done faster,
+	// but it's probably okay for now.
+	if err := us.seqFd.Truncate(0); err != nil {
+		return 0, err
+	}
+
+	if _, err := us.seqFd.WriteString(strconv.FormatUint(us.seq, 10)); err != nil {
+		return 0, err
+	}
+
+	if err := us.seqFd.Sync(); err != nil {
+		return 0, err
+	}
 
 	if err := us.idxLog.Push(loc, us.idx.Trailer()); err != nil {
 		return 0, err

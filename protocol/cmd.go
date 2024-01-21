@@ -63,3 +63,14 @@ func DecodeCmd(data []byte) (uint64, CmdType, []byte, error) {
 	payload := data[MessageHeaderSize+4:]
 	return header.ID, cmd, payload, nil
 }
+
+///////////// INDIVIDUAL CMDS /////////////
+
+type CmdRequestTopicClear struct {
+	Topic string `json:"topic,omitempty"`
+}
+
+type CmdResponseTopicClear struct {
+	Topic    string `json:"topic,omitempty"`
+	NCleared int    `json:"n_cleared,omitempty"`
+}

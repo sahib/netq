@@ -71,15 +71,6 @@ func (ch *CmdHandler) OnWrite(ctx context.Context, w io.Writer) error {
 	}
 }
 
-type RequestTopicClear struct {
-	Topic TopicSpec `json:"topic,omitempty"`
-}
-
-type ResponseTopicClear struct {
-	Topic    TopicSpec `json:"topic,omitempty"`
-	NCleared int       `json:"n_cleared,omitempty"`
-}
-
 func (ch *CmdHandler) handleCommand(cmd protocol.CmdType, data []byte) (any, error) {
 	switch cmd {
 	case protocol.CmdTypePing:
@@ -87,17 +78,18 @@ func (ch *CmdHandler) handleCommand(cmd protocol.CmdType, data []byte) (any, err
 		// the existence of the message is enough.
 		return []byte{}, nil
 	case protocol.CmdTypeTopicClear:
-		var req RequestTopicClear
+		var req protocol.CmdRequestTopicClear
 		if err := json.Unmarshal(data, &req); err != nil {
 			return nil, err
 		}
 
-		topic, err := ch.topics.Ref(req.Topic)
+		ts := TopicSpec(req.Topic)
+		topic, err := ch.topics.Ref(ts)
 		if err != nil {
 			return nil, err
 		}
 
-		fork, err := topic.Fork(req.Topic.ForkName())
+		fork, err := topic.Fork(ts.ForkName())
 		if err != nil {
 			return nil, err
 		}
@@ -107,7 +99,7 @@ func (ch *CmdHandler) handleCommand(cmd protocol.CmdType, data []byte) (any, err
 			return nil, err
 		}
 
-		return ResponseTopicClear{
+		return protocol.CmdResponseTopicClear{
 			Topic:    req.Topic,
 			NCleared: ncleared,
 		}, nil

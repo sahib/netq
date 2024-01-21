@@ -41,7 +41,7 @@ var (
 
 	CommandClientPub = &cli.Command{
 		Name:    "client",
-		Action:  HandleClientPub,
+		Action:  withClient(HandleClientPub),
 		Aliases: []string{"p"},
 		Usage:   "Publish to a topic",
 		Flags: []cli.Flag{
@@ -53,11 +53,9 @@ var (
 		},
 	}
 
-	// TODO: ping command?
-
 	CommandClientSub = &cli.Command{
 		Name:    "client",
-		Action:  HandleClientSub,
+		Action:  withClient(HandleClientSub),
 		Aliases: []string{"s"},
 		Usage:   "Subscribe to a topic",
 		Flags: []cli.Flag{
@@ -66,26 +64,45 @@ var (
 				Aliases: []string{"t"},
 				Usage:   "The topic/fork to sub",
 			},
-			// TODO: option to not ack.
 			// TODO: option to wait n batches before exiting.
+		},
+	}
+
+	CommandClientPing = &cli.Command{
+		Name:   "ping",
+		Action: withClient(HandleClientPing),
+		Usage:  "Ping the server",
+		Flags: []cli.Flag{
+			&cli.IntFlag{
+				Name:    "count",
+				Aliases: []string{"c"},
+				Usage:   "Stop after sending pings (0 = infinite)",
+				Value:   0,
+			},
 		},
 	}
 )
 
-func HandleClientPub(ctx *cli.Context) error {
-	sigCtx, cancel := sigContext(context.Background())
-	defer cancel()
+func withClient(fn func(ctx *cli.Context, client *client.Client, sigCtx context.Context) error) cli.ActionFunc {
+	return func(ctx *cli.Context) error {
+		sigCtx, cancel := sigContext(context.Background())
+		defer cancel()
 
-	opts := client.DefaultOptions()
-	opts.Addr = ctx.String("addr")
-	ctl := client.New(opts)
+		opts := client.DefaultOptions()
+		opts.Addr = ctx.String("addr")
+		ctl := client.New(opts)
 
-	ctl.OnError(func(err error, _ bool) bool {
-		cancel()
-		fmt.Printf("error during pub: %v", err)
-		return false
-	})
+		ctl.OnError(func(err error, _ bool) bool {
+			cancel()
+			fmt.Printf("error during sub: %v", err)
+			return false
+		})
 
+		return fn(ctx, ctl, sigCtx)
+	}
+}
+
+func HandleClientPub(ctx *cli.Context, ctl *client.Client, sigCtx context.Context) error {
 	ackCh := make(chan uint64)
 	topic := ctx.String("topic")
 	pub, err := ctl.Pub(sigCtx, topic, func(id uint64) error {
@@ -115,9 +132,11 @@ func HandleClientPub(ctx *cli.Context) error {
 			return fmt.Errorf("key error at line %d: %w", lineIdx, err)
 		}
 
+		cpy := make([]byte, len(split[1]))
+		copy(cpy, split[1])
 		items = append(items, timeq.Item{
 			Key:  timeq.Key(key),
-			Blob: split[1], // TODO: copy.
+			Blob: cpy,
 		})
 	}
 
@@ -137,20 +156,7 @@ func HandleClientPub(ctx *cli.Context) error {
 	}
 }
 
-func HandleClientSub(ctx *cli.Context) error {
-	sigCtx, cancel := sigContext(context.Background())
-	defer cancel()
-
-	opts := client.DefaultOptions()
-	opts.Addr = ctx.String("addr")
-	ctl := client.New(opts)
-
-	ctl.OnError(func(err error, _ bool) bool {
-		cancel()
-		fmt.Printf("error during sub: %v", err)
-		return false
-	})
-
+func HandleClientSub(ctx *cli.Context, ctl *client.Client, sigCtx context.Context) error {
 	topic := ctx.String("topic")
 	sub, err := ctl.Sub(sigCtx, topic, func(batch *client.Batch) error {
 		for _, item := range batch.Items {
@@ -165,7 +171,34 @@ func HandleClientSub(ctx *cli.Context) error {
 		return err
 	}
 
-	<-sigCtx.Done()
 	defer sub.Close()
+	<-sigCtx.Done()
 	return nil
+}
+
+func HandleClientPing(ctx *cli.Context, ctl *client.Client, sigCtx context.Context) error {
+	cmdCtl, err := ctl.Cmd(sigCtx)
+	if err != nil {
+		return err
+	}
+
+	maxCount := ctx.Int("count")
+	count := 0
+	tckr := time.NewTicker(time.Second)
+	for {
+		select {
+		case <-tckr.C:
+			if err := cmdCtl.Ping(sigCtx); err != nil {
+				return err
+			}
+
+			count++
+			if count >= maxCount {
+				return nil
+			}
+
+		case <-sigCtx.Done():
+			return sigCtx.Err()
+		}
+	}
 }

@@ -37,7 +37,7 @@ type Options struct {
 
 func DefaultOptions() *Options {
 	return &Options{
-		Addr:             "127.0.0.1:9876",
+		Addr:             "ws://127.0.0.1:9876",
 		StorageDir:       "/var/netq",
 		WebsocketOptions: DefaultWebsocketOptions(),
 		TopicOptions:     DefaultTopicOptions(),
@@ -98,6 +98,17 @@ func (s *Server) Serve() error {
 	mux.HandleFunc("/cmd", s.updateRequestToWebsocket)
 
 	// TODO: Implement prometheus exporter
+	// Metrics (should be the same as a stats endpoint):
+	// - Number of topics
+	// - Number of connections
+	// - Per-topic:
+	//    - Name
+	//    - Size in Bytes
+	//    - Number of messages waiting
+	//    - Number of messages unacked
+	//    - Number of messages pushed
+	//    - Number of messages popped
+
 	s.srv.Handler = mux
 
 	// run server in background:
@@ -151,7 +162,6 @@ func (s *Server) topicForRequest(vals url.Values) (*Topic, TopicSpec, error) {
 	return topic, topicSpec, err
 }
 
-// TODO: We should probably exit the ws handler after setup to save some memory.
 func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
