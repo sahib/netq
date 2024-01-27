@@ -88,8 +88,6 @@ func (tl timeqLogger) Printf(fmtSpec string, args ...any) {
 }
 
 type TopicOptions struct {
-	// TODO: Option to limit size of unacked queue.
-	//       (akin to "max unacked")
 	TimeqOpts timeq.Options
 }
 
@@ -237,6 +235,10 @@ func (tf *TopicFork) Ack(id uint64) (int, error) {
 	return tf.ustore.Ack(id)
 }
 
+func (tf *TopicFork) Unacked() uint64 {
+	return tf.ustore.Len()
+}
+
 func (tf *TopicFork) Restart() (int, error) {
 	defer tf.t.wakeup()
 	return tf.ustore.Clear(func(items timeq.Items) error {
@@ -348,6 +350,7 @@ func (tt *Topics) Close() error {
 }
 
 type UnackedStore struct {
+	mu     sync.Mutex
 	dir    string
 	log    *vlog.Log
 	idx    *index.Index
@@ -419,6 +422,9 @@ func LoadUnackedStore(dir string) (*UnackedStore, error) {
 }
 
 func (us *UnackedStore) Push(items timeq.Items) (uint64, error) {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
 	loc, err := us.log.Push(items)
 	if err != nil {
 		return 0, err
@@ -450,7 +456,17 @@ func (us *UnackedStore) Push(items timeq.Items) (uint64, error) {
 	return uint64(loc.Key), nil
 }
 
+func (us *UnackedStore) Len() uint64 {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
+	return uint64(us.idx.Len())
+}
+
 func (us *UnackedStore) Ack(id uint64) (int, error) {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
 	// delete the referenced batch from the index
 	// and push a marker to the idx log that indicate it was
 	// deleted (used during reconstruction of the log.)
@@ -461,7 +477,7 @@ func (us *UnackedStore) Ack(id uint64) (int, error) {
 	return 0, us.idxLog.Push(item.Location{
 		Key: timeq.Key(id),
 		Off: 0,
-		Len: 0,
+		Len: 0, // len=0 means deleted batch.
 	}, us.idx.Trailer())
 }
 
@@ -469,6 +485,9 @@ func (us *UnackedStore) Ack(id uint64) (int, error) {
 // and call `fn` for each of them. It returns the number of unacked messages
 // and, possibly, an error.
 func (us *UnackedStore) Clear(fn timeq.ReadFn) (int, error) {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
 	iter := us.idx.Iter()
 	items := make(timeq.Items, 0, 2000)
 	unacked := 0
@@ -507,6 +526,9 @@ func (us *UnackedStore) Clear(fn timeq.ReadFn) (int, error) {
 }
 
 func (us *UnackedStore) Close() error {
+	us.mu.Lock()
+	defer us.mu.Unlock()
+
 	return errors.Join(
 		us.idxLog.Close(),
 		us.log.Close(),

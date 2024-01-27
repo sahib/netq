@@ -64,8 +64,15 @@ var (
 				Aliases: []string{"t"},
 				Usage:   "The topic/fork to sub",
 			},
-			// TODO: option to wait n batches before exiting.
+			&cli.IntFlag{
+				Name:    "max-messages",
+				Aliases: []string{"c"},
+				Usage:   "Max messages to receive before quitting; <= 0 disables",
+			},
 		},
+
+		// TODO: Support setting the url query params.
+		// (ack_timeout and max_unacked)
 	}
 
 	CommandClientPing = &cli.Command{
@@ -157,6 +164,7 @@ func HandleClientPub(ctx *cli.Context, ctl *client.Client, sigCtx context.Contex
 }
 
 func HandleClientSub(ctx *cli.Context, ctl *client.Client, sigCtx context.Context) error {
+	msgCountCh := make(chan int, 1)
 	topic := ctx.String("topic")
 	sub, err := ctl.Sub(sigCtx, topic, func(batch *client.Batch) error {
 		for _, item := range batch.Items {
@@ -164,6 +172,7 @@ func HandleClientSub(ctx *cli.Context, ctl *client.Client, sigCtx context.Contex
 		}
 
 		batch.Ack()
+		msgCountCh <- len(batch.Items)
 		return nil
 	})
 
@@ -172,8 +181,20 @@ func HandleClientSub(ctx *cli.Context, ctl *client.Client, sigCtx context.Contex
 	}
 
 	defer sub.Close()
-	<-sigCtx.Done()
-	return nil
+
+	var totalMsgCount int
+	var maxMessages = ctx.Int("max-messages")
+	for {
+		select {
+		case <-sigCtx.Done():
+			return sigCtx.Err()
+		case count := <-msgCountCh:
+			totalMsgCount += count
+			if maxMessages > 0 && totalMsgCount > maxMessages {
+				return nil
+			}
+		}
+	}
 }
 
 func HandleClientPing(ctx *cli.Context, ctl *client.Client, sigCtx context.Context) error {

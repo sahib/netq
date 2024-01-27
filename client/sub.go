@@ -70,6 +70,9 @@ func (s *Sub) ioLoop(ctx context.Context, conn *websocket.Conn, onMessage func(b
 				ID:    id,
 				Items: items,
 			}
+
+			batch.
+
 			if err := onMessage(&batch); err != nil {
 				// user defined errors also do not indicate that we should reconnect.
 				s.client.onError(err, false)
@@ -99,7 +102,15 @@ func (c *Client) Sub(ctx context.Context, topic string, onMessage func(b *Batch)
 	return sub, nil
 }
 
+func (s *Sub) ResendUnacked() {
+	s.ackCh <- 0
+}
+
 func (s *Sub) Ack(id uint64) {
+	if id == 0 {
+		return
+	}
+
 	s.ackCh <- id
 }
 
