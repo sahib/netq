@@ -2,8 +2,8 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -31,7 +31,7 @@ func (c *Client) OnError(fn func(err error, canReconnect bool) bool) {
 func (c *Client) connect(ctx context.Context, url string) (*websocket.Conn, error) {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("connect: %w", err)
 	}
 
 	extendDeadline := func() error {
@@ -44,6 +44,7 @@ func (c *Client) connect(ctx context.Context, url string) (*websocket.Conn, erro
 	}
 
 	conn.SetPongHandler(func(_ string) error {
+		fmt.Println("PONG!")
 		return extendDeadline()
 	})
 
@@ -84,20 +85,18 @@ func (c *Client) reconnect(ctx context.Context, err error, url string) *websocke
 }
 
 func (c *Client) buildURL(path string, params map[string]string) string {
-	scheme := "ws"
-	if strings.HasPrefix(c.opts.Addr, "wss") {
-		scheme = "wss"
+	u, err := url.Parse(c.opts.Addr)
+	if err != nil {
+		panic(err) // TODO: Should not happen at this point.
 	}
 
-	u := url.URL{
-		Scheme: scheme,
-		Host:   c.opts.Addr,
-		Path:   path,
-	}
+	u.Path = path
 
+	var query = u.Query()
 	for key, val := range params {
-		u.Query().Set(key, val)
+		query.Set(key, val)
 	}
 
+	u.RawQuery = query.Encode()
 	return u.String()
 }

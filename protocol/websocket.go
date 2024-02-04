@@ -1,4 +1,4 @@
-package server
+package protocol
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 type Handler interface {
 	OnWrite(ctx context.Context, w io.Writer) error
 	OnRead(ctx context.Context, r io.Reader) error
+	OnClose(err error)
 }
 
 type WebsocketOptions struct {
@@ -62,10 +63,10 @@ func (h *WebsocketConn) Options() *WebsocketOptions {
 	return h.opts
 }
 
-// abort aborts the current connection by canceling the context
-// and sending a close message (as best effort) to the client.
-// It may only be called on the write side. Use abortCh for the rest.
-func (h *WebsocketConn) abort(err error) {
+// Abort aborts the current connection by canceling the context and sending a
+// close message (as best effort) to the client. It may only be called on the
+// write side, i.e. the go routine that created the websocket connection.
+func (h *WebsocketConn) Abort(handler Handler, err error) {
 	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 		return
 	}
@@ -97,10 +98,11 @@ func (h *WebsocketConn) abort(err error) {
 	}
 
 	h.cancel()
-	h.cancel = nil
+	if handler != nil {
+		handler.OnClose(err)
+	}
 
 	time.Sleep(500 * time.Millisecond)
-	fmt.Println("CLOSE")
 	h.conn.Close()
 }
 
@@ -117,21 +119,21 @@ func (h *WebsocketConn) serveWrites(ctx context.Context, handler Handler) {
 				err = ctx.Err()
 			}
 
-			h.abort(err)
+			h.Abort(handler, err)
 			return
 		case err := <-h.abortCh:
-			h.abort(err)
+			h.Abort(handler, err)
 			return
 		case <-ticker.C:
-			if err := h.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				h.abort(fmt.Errorf("failed to ping client: %w", err))
+			if err := h.conn.WriteMessage(websocket.PingMessage, []byte("ping")); err != nil {
+				h.Abort(handler, fmt.Errorf("failed to ping client: %w", err))
 				return
 			}
 		default:
 			// NOTE: assumption is that writer() only blocks for a short amount of time.
 			// (e.g. if no data is available to write, but not longer than the ping interval)
 			if err := handler.OnWrite(ctx, &websocketWriter{conn: h.conn}); err != nil {
-				h.abort(fmt.Errorf("failed to write to client: %w", err))
+				h.Abort(handler, fmt.Errorf("failed to write to client: %w", err))
 				return
 			}
 		}
@@ -146,6 +148,7 @@ func (h *WebsocketConn) serveReads(ctx context.Context, handler Handler) {
 			return
 		}
 
+		// NOTE: NextReader() will block until we actually have a message that we can read.
 		_, r, err := h.conn.NextReader()
 		if err != nil {
 			h.abortCh <- fmt.Errorf("failed to read next message: %w", err)
@@ -165,15 +168,15 @@ func (h *WebsocketConn) serveReads(ctx context.Context, handler Handler) {
 func (h *WebsocketConn) Serve(ctx context.Context, handler Handler) {
 	ctx, cancel := context.WithCancel(ctx)
 	h.cancel = cancel
-	defer h.abort(nil)
+	defer h.Abort(handler, nil)
 
 	// Whenever an alive connection returns a PONG, this function is called.
 	// We use this to check if the peer is still alive and well. If not
 	// we clean up the connection to save resources.
-	h.conn.SetPongHandler(func(string) error {
+	h.conn.SetPongHandler(func(_ string) error {
 		// extend the read deadline for some time:
 		if err := h.conn.SetReadDeadline(time.Now().Add(h.opts.PongTimeout)); err != nil {
-			h.abort(fmt.Errorf("failed to set deadline: %w", err))
+			h.Abort(handler, fmt.Errorf("failed to set deadline: %w", err))
 			return err
 		}
 
@@ -187,7 +190,7 @@ func (h *WebsocketConn) Serve(ctx context.Context, handler Handler) {
 	// go-routine: https://github.com/gorilla/websocket/issues/595
 	//
 	// We also send pings regularly to learn if the client is still alive.
-	// See the SetPongHandler() call below.
+	// See the SetPongHandler() call above.
 	h.serveWrites(ctx, handler)
 }
 

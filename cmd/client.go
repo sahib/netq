@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
@@ -40,7 +41,7 @@ var (
 	}
 
 	CommandClientPub = &cli.Command{
-		Name:    "client",
+		Name:    "pub",
 		Action:  withClient(HandleClientPub),
 		Aliases: []string{"p"},
 		Usage:   "Publish to a topic",
@@ -54,7 +55,7 @@ var (
 	}
 
 	CommandClientSub = &cli.Command{
-		Name:    "client",
+		Name:    "sub",
 		Action:  withClient(HandleClientSub),
 		Aliases: []string{"s"},
 		Usage:   "Subscribe to a topic",
@@ -99,11 +100,17 @@ func withClient(fn func(ctx *cli.Context, client *client.Client, sigCtx context.
 		opts.Addr = ctx.String("addr")
 		ctl := client.New(opts)
 
-		ctl.OnError(func(err error, _ bool) bool {
+		ctl.OnError(func(err error, retry bool) bool {
 			cancel()
-			fmt.Printf("error during sub: %v", err)
+			slog.Error("async client error", "err", err, "retry", retry)
 			return false
 		})
+
+		// TODO: Is that necessary?
+		go func() {
+			<-sigCtx.Done()
+			os.Stdin.Close()
+		}()
 
 		return fn(ctx, ctl, sigCtx)
 	}
@@ -122,7 +129,9 @@ func HandleClientPub(ctx *cli.Context, ctl *client.Client, sigCtx context.Contex
 		return err
 	}
 
-	// Read data to push from stdin:
+	// Read data to push from stdin.
+	// Format is one item per line,
+	// with each line being KEY:VAL
 	var lineIdx int
 	var items client.Items
 	scanner := bufio.NewScanner(os.Stdin)
@@ -147,12 +156,16 @@ func HandleClientPub(ctx *cli.Context, ctl *client.Client, sigCtx context.Contex
 		})
 	}
 
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
 	if len(items) == 0 {
 		fmt.Println("nothing pushed")
 		return nil
 	}
 
-	pub.Push(items)
+	fmt.Println(pub.Push(items))
 	select {
 	case <-ackCh:
 		// NOTE: we don't check for which message we got an ACk

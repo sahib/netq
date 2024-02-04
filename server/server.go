@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sahib/netq/protocol"
 )
 
 var (
@@ -30,7 +31,7 @@ var (
 type Options struct {
 	Addr             string
 	StorageDir       string
-	WebsocketOptions WebsocketOptions
+	WebsocketOptions protocol.WebsocketOptions
 	TopicOptions     TopicOptions
 	SubOptions       SubOptions
 }
@@ -39,19 +40,31 @@ func DefaultOptions() *Options {
 	return &Options{
 		Addr:             "ws://127.0.0.1:9876",
 		StorageDir:       "/var/netq",
-		WebsocketOptions: DefaultWebsocketOptions(),
+		WebsocketOptions: protocol.DefaultWebsocketOptions(),
 		TopicOptions:     DefaultTopicOptions(),
 		SubOptions:       DefaultSubOptions(),
 	}
 }
 
 func (c *Options) Validate() error {
+	if _, err := url.Parse(c.Addr); err != nil {
+		return fmt.Errorf("addr (%v) is invalid: %w", c.Addr, err)
+	}
+
+	if err := os.MkdirAll(c.StorageDir, 0700); err != nil {
+		return fmt.Errorf("failed to create storage dir (%v): %w", c.StorageDir, err)
+	}
+
 	if err := c.TopicOptions.Validate(); err != nil {
-		return err
+		return fmt.Errorf("topic options: %w", err)
 	}
 
 	if err := c.WebsocketOptions.Validate(); err != nil {
-		return err
+		return fmt.Errorf("websocket options: %w", err)
+	}
+
+	if err := c.SubOptions.Validate(); err != nil {
+		return fmt.Errorf("sub options: %w", err)
 	}
 
 	return nil
@@ -70,9 +83,15 @@ func NewServer(ctx context.Context, cfg *Options) (*Server, error) {
 		return nil, err
 	}
 
+	u, err := url.Parse(cfg.Addr)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.Info("configuration seems to be valid")
 	ctx, cancel := context.WithCancel(ctx)
 	srv := &http.Server{
-		Addr:         cfg.Addr,
+		Addr:         u.Host,
 		WriteTimeout: time.Second * 15,
 		ReadTimeout:  time.Second * 15,
 		IdleTimeout:  time.Second * 60,
@@ -114,8 +133,11 @@ func (s *Server) Serve() error {
 	// run server in background:
 	var srvErrCh chan error
 	go func() {
+		defer slog.Debug("server exited")
 		srvErrCh <- s.srv.ListenAndServe()
 	}()
+
+	slog.Info("server is ready and running", "addr", s.cfg.Addr)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
@@ -169,42 +191,45 @@ func (s *Server) updateRequestToWebsocket(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	wsh := NewWebsocketConn(conn, &s.cfg.WebsocketOptions)
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
+	wsh := protocol.NewWebsocketConn(conn, &s.cfg.WebsocketOptions)
 
 	vals := r.URL.Query()
 	topic, topicSpec, err := s.topicForRequest(vals)
 	if err != nil {
-		wsh.abort(err)
+		wsh.Abort(nil, err)
+		s.topics.Unref(topicSpec)
 		return
 	}
 
-	defer s.topics.Unref(topicSpec)
-
-	var handler Handler
+	var handler protocol.Handler
 	switch r.URL.Path {
 	case "/sub":
 		// Allow overwriting parts of the configuration via query params:
 		subOpts, err := s.cfg.SubOptions.OverlayWithURLParams(vals)
 		if err != nil {
-			wsh.abort(err)
+			wsh.Abort(nil, err)
+			s.topics.Unref(topicSpec)
 			return
 		}
 
-		handler, err = NewSubHandler(r.Context(), topic, topicSpec, subOpts)
+		handler, err = NewSubHandler(topic, topicSpec, subOpts)
 		if err != nil {
-			wsh.abort(err)
+			wsh.Abort(nil, err)
+			s.topics.Unref(topicSpec)
 			return
 		}
 	case "/pub":
 		handler = NewPubHandler(topic)
 	default:
-		wsh.abort(fmt.Errorf("invalid handler path: %s", r.URL.Path))
+		wsh.Abort(nil, fmt.Errorf("invalid handler path: %s", r.URL.Path))
+		s.topics.Unref(topicSpec)
 		return
 	}
 
 	// NOTE: Let the handler return, we'll handle the websocket in another go routine.
 	// The http webserver can then GC open buffers.
-	go wsh.Serve(ctx, handler)
+	go func() {
+		wsh.Serve(s.ctx, handler)
+		s.topics.Unref(topicSpec)
+	}()
 }

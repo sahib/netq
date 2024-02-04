@@ -62,3 +62,7 @@ func (ph *PubHandler) OnWrite(ctx context.Context, w io.Writer) error {
 	ph.lastPubID = ph.currPubID
 	return err
 }
+
+func (ph *PubHandler) OnClose(_ error) {
+	// nothing to do.
+}

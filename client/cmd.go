@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/sahib/netq/protocol"
@@ -17,46 +19,84 @@ type cmdPackage struct {
 type Cmd struct {
 	cancel func()
 	conn   *websocket.Conn
-	client *Client
-	url    string
 	cmdEnc protocol.CmdEncoder
 	currID uint64
+
+	// Make the async protocol look like sync:
+	packCh   chan cmdPackage
+	respCond *sync.Cond
+	resp     map[uint64]cmdPackage
 }
 
-func (c *Cmd) send(ctx context.Context, pack cmdPackage) (cmdPackage, error) {
-	data := c.cmdEnc.Encode(
-		pack.ID,
-		pack.Cmd,
-		pack.Payload,
-	)
+type cmdImpl struct {
+	*Cmd
+}
 
-	if err := c.conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-		c.conn = c.client.reconnect(ctx, err, c.url)
-		if c.conn == nil {
-			return cmdPackage{}, err
-		}
+func (c *cmdImpl) OnWrite(ctx context.Context, w io.Writer) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case pack := <-c.packCh:
+		return c.conn.WriteMessage(
+			websocket.BinaryMessage,
+			c.cmdEnc.Encode(
+				pack.ID,
+				pack.Cmd,
+				pack.Payload,
+			),
+		)
 	}
+}
 
-	_, message, err := c.conn.ReadMessage()
+func (c *cmdImpl) OnRead(ctx context.Context, r io.Reader) error {
+	message, err := io.ReadAll(r)
 	if err != nil {
-		// attempt reconnect:
-		c.conn = c.client.reconnect(ctx, err, c.url)
-		if c.conn == nil {
-			// return original error in this case:
-			return cmdPackage{}, err
-		}
+		return err
 	}
 
 	id, cmd, payload, err := protocol.DecodeCmd(message)
 	if err != nil {
-		return cmdPackage{}, err
+		return err
 	}
 
-	return cmdPackage{
+	c.respCond.L.Lock()
+	c.resp[id] = cmdPackage{
 		ID:      id,
 		Cmd:     cmd,
 		Payload: payload,
-	}, nil
+	}
+	c.respCond.Broadcast()
+	c.respCond.L.Unlock()
+
+	return nil
+}
+
+func (c *cmdImpl) OnClose(err error) {
+}
+
+/////////////
+
+func (c *Cmd) send(ctx context.Context, pack cmdPackage) (cmdPackage, error) {
+	c.packCh <- pack
+
+	var ok bool
+	c.respCond.L.Lock()
+	for {
+		pack, ok = c.resp[pack.ID]
+		if ok {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return cmdPackage{}, ctx.Err()
+		default:
+			// wait until response available.
+			c.respCond.Wait()
+		}
+	}
+	c.respCond.L.Unlock()
+	return pack, nil
 }
 
 func (c *Cmd) nextID() uint64 {
@@ -109,13 +149,19 @@ func (c *Client) Cmd(ctx context.Context) (*Cmd, error) {
 		return nil, err
 	}
 
-	return &Cmd{
-		client: c,
-		cancel: cancel,
-		conn:   conn,
-		url:    url,
-		cmdEnc: protocol.CmdEncoder{},
-	}, nil
+	wh := protocol.NewWebsocketConn(conn, &c.opts.WebsocketOptions)
+
+	cmd := &Cmd{
+		cancel:   cancel,
+		conn:     conn,
+		cmdEnc:   protocol.CmdEncoder{},
+		resp:     make(map[uint64]cmdPackage),
+		respCond: sync.NewCond(&sync.Mutex{}),
+		packCh:   make(chan cmdPackage, 1),
+	}
+
+	go wh.Serve(ctx, &cmdImpl{Cmd: cmd})
+	return cmd, nil
 }
 
 func (s *Cmd) Close() error {

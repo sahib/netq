@@ -2,62 +2,60 @@ package client
 
 import (
 	"context"
+	"io"
 	"sync/atomic"
+	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/sahib/netq/protocol"
 )
 
 type Pub struct {
-	pubid   uint64
-	client  *Client
-	cancel  func()
-	batchCh chan *Batch
-	url     string
+	pubid    uint64
+	cancel   func()
+	batchCh  chan *Batch
+	batchEnc protocol.BatchEncoder
+	onAck    func(id uint64) error
 }
 
-func (p *Pub) ioLoop(ctx context.Context, conn *websocket.Conn, onAck func(id uint64) error) {
-	defer conn.Close()
-	var batchEnc protocol.BatchEncoder
+// make sure that On{Write,Read,Close} are not public methods.
+type pubImpl struct {
+	*Pub
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case batch := <-p.batchCh:
-			data := batchEnc.Encode(batch.ID, batch.Items)
-			if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-				conn = p.client.reconnect(ctx, err, p.url)
-				if conn == nil {
-					return
-				}
-			}
-		default:
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				conn = p.client.reconnect(ctx, err, p.url)
-				if conn == nil {
-					return
-				}
-				return
-			}
-
-			if onAck == nil {
-				continue
-			}
-
-			id, err := protocol.DecodeAck(message)
-			if err != nil {
-				p.client.onError(err, false)
-				return
-			}
-
-			if err := onAck(id); err != nil {
-				p.client.onError(err, false)
-				return
-			}
-		}
+func (p *pubImpl) OnWrite(ctx context.Context, w io.Writer) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case batch := <-p.batchCh:
+		data := p.batchEnc.Encode(batch.ID, batch.Items)
+		_, err := w.Write(data)
+		return err
+	case <-time.After(5 * time.Second):
+		// TODO: is this branch necessary?
+		return nil
 	}
+}
+
+func (p *pubImpl) OnRead(ctx context.Context, r io.Reader) error {
+	message, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+
+	if p.onAck == nil {
+		return nil
+	}
+
+	id, err := protocol.DecodeAck(message)
+	if err != nil {
+		return err
+	}
+
+	return p.onAck(id)
+}
+
+func (p *pubImpl) OnClose(err error) {
+	// TODO: Check if canceled. If not, reconnect?
 }
 
 func (c *Client) Pub(ctx context.Context, topic string, onAck func(id uint64) error) (*Pub, error) {
@@ -69,14 +67,15 @@ func (c *Client) Pub(ctx context.Context, topic string, onAck func(id uint64) er
 		return nil, err
 	}
 
+	wh := protocol.NewWebsocketConn(conn, &c.opts.WebsocketOptions)
+
 	pub := &Pub{
-		client:  c,
 		cancel:  cancel,
 		batchCh: make(chan *Batch, 10),
-		url:     url,
+		onAck:   onAck,
 	}
 
-	go pub.ioLoop(ctx, conn, onAck)
+	go wh.Serve(ctx, &pubImpl{Pub: pub})
 	return pub, nil
 }
 

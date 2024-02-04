@@ -6,8 +6,8 @@ import (
 )
 
 const (
-	MessageHeaderSize = 12
-	ItemHeaderSize    = 16
+	MessageHeaderSize = 16
+	ItemHeaderSize    = 12
 
 	MaxMessageSize = 64 * 1024 * 1024
 	MaxItemSize    = 16 * 1024 * 1024
@@ -56,7 +56,7 @@ func DecodeHeader(data []byte) (Header, error) {
 		return header, fmt.Errorf("message is bigger than %d: %v", MaxMessageSize, header.Size)
 	}
 
-	header.ID = binary.BigEndian.Uint64(data[8:12])
+	header.ID = binary.BigEndian.Uint64(data[8:16])
 	return header, nil
 }
 

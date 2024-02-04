@@ -5,18 +5,21 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/sahib/netq/protocol"
 	"github.com/sahib/netq/server"
 )
 
 type Options struct {
-	Addr        string
-	ReadTimeout time.Duration
+	Addr             string
+	ReadTimeout      time.Duration
+	WebsocketOptions protocol.WebsocketOptions
 }
 
 func DefaultOptions() Options {
 	return Options{
-		Addr:        server.DefaultOptions().Addr,
-		ReadTimeout: 15 * time.Second,
+		Addr:             server.DefaultOptions().Addr,
+		ReadTimeout:      15 * time.Second,
+		WebsocketOptions: protocol.DefaultWebsocketOptions(),
 	}
 }
 

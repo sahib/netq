@@ -9,7 +9,7 @@ type AckEncoder struct {
 }
 
 func (ae *AckEncoder) Encode(id uint64) []byte {
-	var size uint32 = MessageHeaderSize + 8
+	var size uint32 = MessageHeaderSize
 	if len(ae.buf) < int(size) {
 		ae.buf = make([]byte, size)
 	}

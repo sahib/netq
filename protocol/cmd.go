@@ -23,7 +23,7 @@ type CmdEncoder struct {
 }
 
 func (ce *CmdEncoder) Encode(id uint64, cmd CmdType, payload []byte) []byte {
-	var size uint32 = MessageHeaderSize + 4 + uint32(len(payload))
+	size := MessageHeaderSize + 4 + uint32(len(payload))
 	if len(ce.buf) < int(size) {
 		ce.buf = make([]byte, size)
 	}

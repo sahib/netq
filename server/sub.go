@@ -15,6 +15,8 @@ import (
 	"github.com/sahib/timeq"
 )
 
+// TODO: Show topic name in logs.
+
 type SubOptions struct {
 	// AckTimeout defines the amount of time to wait before re-sending a batch
 	// of messages.
@@ -77,7 +79,6 @@ func DefaultSubOptions() SubOptions {
 }
 
 type SubHandler struct {
-	ctx      context.Context
 	fork     *TopicFork
 	ackReset chan bool
 	enc      protocol.BatchEncoder
@@ -88,7 +89,7 @@ type SubHandler struct {
 	copyBuf  []byte
 }
 
-func NewSubHandler(ctx context.Context, topic *Topic, topicSpec TopicSpec, opts SubOptions) (*SubHandler, error) {
+func NewSubHandler(topic *Topic, topicSpec TopicSpec, opts SubOptions) (*SubHandler, error) {
 	// If topic spec included a fork name, we should use that and no consume
 	// stuff from the main queue. If  the fork name was empty or default, then
 	// we this return the consumer for the main queue anyways.
@@ -103,9 +104,8 @@ func NewSubHandler(ctx context.Context, topic *Topic, topicSpec TopicSpec, opts 
 		return nil, err
 	}
 
-	slog.Info("start of sub", "topic", topicSpec, "unacked", unacked)
+	slog.Info("new subscription opened", "topic", topicSpec, "unacked", unacked)
 	sh := &SubHandler{
-		ctx:      ctx,
 		opts:     opts,
 		fork:     fork,
 		ackReset: make(chan bool, 5),
@@ -145,12 +145,17 @@ func (sh *SubHandler) handleAcks() {
 			// We did not receive an ack in a duration of AckTimeout
 			// Continue with the restart after the select.
 			ackTimer = time.After(sh.opts.AckTimeout)
-		case <-sh.ackReset:
+		case v := <-sh.ackReset:
+			if !v {
+				// channel was closed.
+				return
+			}
+
 			// reset the ack timeout because we received another ack.
 			ackTimer = time.After(sh.opts.AckTimeout)
 			continue
-		case <-sh.ctx.Done():
-			return
+		// case <-sh.ctx.Done():
+		// 	return
 		case <-maxUnackedTckr.C:
 			maxUnacked := sh.opts.MaxUnacked
 			if maxUnacked == 0 {
@@ -172,10 +177,12 @@ func (sh *SubHandler) handleAcks() {
 			continue
 		}
 
-		slog.Info(
-			"did not receive ack in time or too many unacked messages - resending unacked",
-			slog.Int("count", unacked),
-		)
+		if unacked > 0 {
+			slog.Info(
+				"did not receive ack in time or too many unacked messages - resending unacked",
+				slog.Int("count", unacked),
+			)
+		}
 	}
 }
 
@@ -190,25 +197,27 @@ func (sh *SubHandler) OnRead(ctx context.Context, r io.Reader) error {
 		return err
 	}
 
-	if id != 0 {
-		acked, err := sh.fork.Ack(id)
-		if err != nil {
-			return err
-		}
-
-		slog.Info("received acked", slog.Int("count", acked))
-	} else {
+	sh.ackReset <- true
+	if id == 0 {
 		// A ACK with a id of zero indicates that the client wants to
 		// have all unacked messages right now.
-		unacked, err := sh.fork.Restart()
+		var unacked int
+		unacked, err = sh.fork.Restart()
 		if err != nil {
 			return err
 		}
 
 		slog.Info("received unack-request", slog.Int("count", unacked))
+		return nil
 	}
 
-	sh.ackReset <- true
+	fmt.Println("ACK", id)
+	acked, err := sh.fork.Ack(id)
+	if err != nil {
+		return err
+	}
+
+	slog.Info("processed ack", slog.Int("count", acked))
 	return nil
 }
 
@@ -224,4 +233,9 @@ func (sh *SubHandler) OnWrite(ctx context.Context, w io.Writer) error {
 			return err
 		},
 	)
+}
+
+func (sh *SubHandler) OnClose(_ error) {
+	// make sure handleAcks exits.
+	close(sh.ackReset)
 }

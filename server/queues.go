@@ -430,8 +430,8 @@ func (us *UnackedStore) Push(items timeq.Items) (uint64, error) {
 		return 0, err
 	}
 
-	loc.Key = timeq.Key(us.seq)
 	us.seq++
+	loc.Key = timeq.Key(us.seq)
 
 	// Sync the current sequence number to disk to make sure
 	// we start with the proper one. This could be probably done faster,
@@ -471,10 +471,8 @@ func (us *UnackedStore) Ack(id uint64) (int, error) {
 	// and push a marker to the idx log that indicate it was
 	// deleted (used during reconstruction of the log.)
 
-	// TODO: Delete() should return the deleted loc, so we can
-	// figure out the number of items we acknowledged.
-	us.idx.Delete(timeq.Key(id))
-	return 0, us.idxLog.Push(item.Location{
+	loc := us.idx.Delete(timeq.Key(id))
+	return int(loc.Len), us.idxLog.Push(item.Location{
 		Key: timeq.Key(id),
 		Off: 0,
 		Len: 0, // len=0 means deleted batch.

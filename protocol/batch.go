@@ -80,9 +80,10 @@ func (be *BatchEncoder) Encode(id uint64, items timeq.Items) []byte {
 
 	off := MessageHeaderSize
 	for idx := 0; idx < len(items); idx++ {
-		binary.BigEndian.Uint64(be.buf[off+0:])
-		binary.BigEndian.Uint32(be.buf[off+8:])
-		copy(be.buf[off+12:], items[idx].Blob)
+		binary.BigEndian.PutUint64(be.buf[off+0:], uint64(items[idx].Key))
+		binary.BigEndian.PutUint32(be.buf[off+8:], uint32(len(items[idx].Blob)))
+		off += copy(be.buf[off+12:], items[idx].Blob)
+		off += ItemHeaderSize
 	}
 
 	return be.buf

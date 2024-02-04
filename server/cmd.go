@@ -108,3 +108,7 @@ func (ch *CmdHandler) handleCommand(cmd protocol.CmdType, data []byte) (any, err
 		return nil, fmt.Errorf("invalid cmd type: %v", cmd)
 	}
 }
+
+func (ch *CmdHandler) OnClose(_ error) {
+	// nothing to do.
+}

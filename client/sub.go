@@ -2,17 +2,12 @@ package client
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/sahib/netq/protocol"
 )
-
-type Sub struct {
-	client *Client
-	cancel func()
-	ackCh  chan uint64
-	url    string
-}
 
 type Batch struct {
 	Sub   *Sub
@@ -25,61 +20,64 @@ func (b *Batch) Ack() {
 	b.Sub.Ack(b.ID)
 }
 
-func (s *Sub) ioLoop(ctx context.Context, conn *websocket.Conn, onMessage func(b *Batch) error) {
-	defer conn.Close()
-	var ackEnc protocol.AckEncoder
+type Sub struct {
+	cancel    func()
+	ackCh     chan uint64
+	onMessage func(b *Batch) error
+	ackEnc    protocol.AckEncoder
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case id := <-s.ackCh:
-			if err := conn.WriteMessage(websocket.BinaryMessage, ackEnc.Encode(id)); err != nil {
-				conn = s.client.reconnect(ctx, err, s.url)
-				if conn == nil {
-					return
-				}
-			}
-		default:
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				conn = s.client.reconnect(ctx, err, s.url)
-				if conn == nil {
-					return
-				}
-			}
+type subImpl struct {
+	*Sub
+}
 
-			if onMessage == nil {
-				continue
-			}
-
-			id, items, err := protocol.DecodeBatch(message)
-			if err != nil {
-				// reconnecting probably won't help if we can't decode a message.
-				s.client.onError(err, false)
-				return
-			}
-
-			// TODO: We do assume here that the message handler does not block
-			// for extended times, as this will cause the connection to timeout
-			// after a while. Have an option to do it in the background + another go?
-			// Or maybe just pass a context for each batch?
-			// Or maybe just document it and let it be?
-			batch := Batch{
-				Sub:   s,
-				ID:    id,
-				Items: items,
-			}
-
-			batch.
-
-			if err := onMessage(&batch); err != nil {
-				// user defined errors also do not indicate that we should reconnect.
-				s.client.onError(err, false)
-				return
-			}
-		}
+// TODO: Those methods are public. :/
+func (s *subImpl) OnRead(ctx context.Context, r io.Reader) error {
+	message, err := io.ReadAll(r)
+	if err != nil {
+		return err
 	}
+
+	if s.onMessage == nil {
+		return nil
+	}
+
+	id, items, err := protocol.DecodeBatch(message)
+	if err != nil {
+		return err
+	}
+
+	// TODO: We do assume here that the message handler does not block
+	// for extended times, as this will cause the connection to timeout
+	// after a while. Have an option to do it in the background + another go?
+	// Or maybe just pass a context for each batch?
+	// Or maybe just document it and let it be?
+	batch := Batch{
+		Sub:   s.Sub,
+		ID:    id,
+		Items: items,
+	}
+
+	fmt.Println("GOT BATCH", id)
+	return s.onMessage(&batch)
+}
+
+func (s *subImpl) OnWrite(ctx context.Context, w io.Writer) error {
+	// TODO: Move ping to general handler.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case id := <-s.ackCh:
+		fmt.Println("ACK", id)
+		_, err := w.Write(s.ackEnc.Encode(id))
+		return err
+	case <-time.After(5 * time.Second):
+		// TODO: is this branch necessary?
+		return nil
+	}
+}
+
+func (s *subImpl) OnClose(err error) {
 }
 
 func (c *Client) Sub(ctx context.Context, topic string, onMessage func(b *Batch) error) (*Sub, error) {
@@ -91,14 +89,15 @@ func (c *Client) Sub(ctx context.Context, topic string, onMessage func(b *Batch)
 		return nil, err
 	}
 
+	wh := protocol.NewWebsocketConn(conn, &c.opts.WebsocketOptions)
+
 	sub := &Sub{
-		client: c,
-		cancel: cancel,
-		url:    url,
-		ackCh:  make(chan uint64, 10),
+		cancel:    cancel,
+		ackCh:     make(chan uint64, 10),
+		onMessage: onMessage,
 	}
 
-	go sub.ioLoop(ctx, conn, onMessage)
+	go wh.Serve(ctx, &subImpl{Sub: sub})
 	return sub, nil
 }
 
